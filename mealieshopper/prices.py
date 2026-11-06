@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 
 STORES = offers.STORES
 MAX_LIMIT = 200
+PUBLIC_OBSERVED_UNKNOWN: str = "public_observed_unknown"
 
 SCHEMA = """
 -- De normale prijs van een product, één per winkel, product en dag (de laatste die we die dag zagen). `source` zegt waar hij
@@ -676,9 +677,17 @@ def _product(store: str, product_id: str, offer: dict[str, Any] | None, observed
             if not product.get(key) and row[column]:
                 product[key] = row[column]
     product.setdefault("title", product_id)
-    product["url"] = product.get("url") or next((row["url"] for row in reversed(observed) if row["url"]), "") or _url(store, product_id)
+    product["url"] = product.get("url") or next(
+        (row["url"] for row in reversed(observed) if row["url"] and row["source"] != PUBLIC_OBSERVED_UNKNOWN), ""
+    ) or _url(store, product_id)
 
-    points: list[tuple[str, float, str]] = [(row["day"], row["price"], "search") for row in observed]
+    product["observed"] = [
+        {"date": row["day"], "price": row["price"], "unitSize": row["unit_size"], "sourceUrl": row["url"]}
+        for row in observed if row["source"] == PUBLIC_OBSERVED_UNKNOWN and row["day"] <= today
+    ]
+    points: list[tuple[str, float, str]] = [
+        (row["day"], row["price"], "search") for row in observed if row["source"] != PUBLIC_OBSERVED_UNKNOWN
+    ]
     for episode in product["episodes"]:
         if _number(episode.get("priceBefore")) is not None:
             for day in (episode.get("start"), episode.get("end")):
@@ -715,6 +724,7 @@ def _product(store: str, product_id: str, offer: dict[str, Any] | None, observed
         str(product.get("lastSeen") or "")[:10],
         segments[-1]["to"] if segments else "",
         purchases[-1]["date"] if purchases else "",
+        product["observed"][-1]["date"] if product["observed"] else "",
     ) if d]
     product["lastActivity"] = max(days) if days else None
     product["savedImages"] = images or []
@@ -1089,7 +1099,10 @@ def _regulars_between(
         if is_measured and measured is not None:
             measured.add(str(product_id))
 
-    for row in conn.execute("SELECT product_id, price FROM price_observations WHERE store = ? AND day >= ? AND day <= ?", (store, since, until)):
+    for row in conn.execute(
+        "SELECT product_id, price FROM price_observations WHERE store = ? AND day >= ? AND day <= ? AND source != ?",
+        (store, since, until, PUBLIC_OBSERVED_UNKNOWN),
+    ):
         add(row["product_id"], row["price"], True)
     last_day = "day < ?" if purchases_before_until else "day <= ?"
     for sql in _purchase_sources(conn, store):
@@ -1113,7 +1126,10 @@ def _annotate(store: str, items: list[dict[str, Any]], today: str) -> None:
     latest: dict[str, Any] = {}
     with closing(_connect()) as conn:
         regulars = _regulars_between(conn, store, since30, today, measured=measured)
-        for row in conn.execute("SELECT * FROM price_observations WHERE store = ? AND day >= ? AND day <= ? ORDER BY day", (store, since_pack, today)):
+        for row in conn.execute(
+            "SELECT * FROM price_observations WHERE store = ? AND day >= ? AND day <= ? AND source != ? ORDER BY day",
+            (store, since_pack, today, PUBLIC_OBSERVED_UNKNOWN),
+        ):
             latest[row["product_id"]] = row
         for row in conn.execute(
             "SELECT * FROM offer_history WHERE store = ? AND COALESCE(valid_until, substr(last_seen, 1, 10)) >= ? ORDER BY product_id, first_seen, id",
