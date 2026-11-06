@@ -15,7 +15,7 @@ from PIL import Image
 
 os.environ["PASSKEY_AUTH_ENABLED"] = "false"
 
-from mealieshopper import audit, auth, auth_password, backup, factory_reset, image_cache, mealie, mealie_images, oauth, profile  # noqa: E402
+from mealieshopper import audit, auth, auth_password, backup, factory_reset, image_cache, mealie, mealie_images, oauth, prices, profile  # noqa: E402
 from mealieshopper.app import create_app  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -202,6 +202,23 @@ class ClassificationTest(BackupCase):
 
 
 class RoundTripTest(BackupCase):
+    def test_public_observed_prices_keep_their_classification_and_provenance(self) -> None:
+        with closing(self.connect()) as conn, conn:
+            conn.execute(
+                "INSERT INTO price_observations (store, product_id, day, source, title, unit_size, url, price, seen_at) "
+                "VALUES ('picnic', 'milk', '2024-01-02', 'public_observed_unknown', 'Milk', '1 l', 'https://example.org/archive', 1.29, '2024-01-02')"
+            )
+        response, data = self.make()
+        self.assertEqual(response.status_code, 200)
+        self.wipe()
+        self.assertEqual(self.restore(data)["status"], "done")
+        product: dict = prices.history("picnic", product="milk")["products"][0]
+        self.assertEqual(product["observed"], [{
+            "date": "2024-01-02", "price": 1.29, "unitSize": "1 l", "sourceUrl": "https://example.org/archive",
+        }])
+        self.assertEqual(product["regular"], [])
+        self.assertIsNone(product["regularPrice"])
+
     def test_everything_comes_back_with_its_links(self):
         self.seed()
         for key, value in SECRETS.items():
