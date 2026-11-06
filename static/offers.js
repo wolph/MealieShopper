@@ -162,8 +162,12 @@ function offersChangeWeek(step) {
   showOffers();
 }
 
+function offersHistoryActive() {
+  return Boolean(document.querySelector("#offers-history.is-active"));
+}
+
 function offersStores() {
-  return OFFERS_STORES.filter((key) => key === "ah" || state.linkedStores[key]);
+  return OFFERS_STORES.filter((key) => offersHistoryActive() || key === "ah" || state.linkedStores[key]);
 }
 
 function offersTabActive() {
@@ -189,7 +193,7 @@ function renderOffersStore() {
   $("#offers-store-list").innerHTML = available
     .map(
       (key) =>
-        `<a class="subtab-menu__item${offersState.store === key ? " is-active" : ""}" data-store="${key}" href="${escapeHtml(offersPath("", { store: key === "ah" ? "" : key }))}" data-nav>${escapeHtml(STORES[key].name)}</a>`
+        `<a class="subtab-menu__item${offersState.store === key ? " is-active" : ""}" data-store="${key}" href="${escapeHtml(offersPath(offersHistoryActive() ? "history" : "", { store: key === "ah" ? "" : key }))}" data-nav>${escapeHtml(STORES[key].name)}</a>`
     )
     .join("");
   if (typeof routerRetry === "function") routerRetry();
@@ -769,11 +773,12 @@ const offersCache = {};
 
 async function showOffers() {
   const loadId = ++offersLoadId;
+  renderOffersStore();
+  if (offersHistoryActive()) return;
   const store = offersState.store;
   const week = offersWeek().start;
   const key = `${store}|${week}`;
   offersState.weekStart = week;
-  renderOffersStore();
   renderOffersWeek();
   message("#offers-message", "");
   const cached = offersCache[key];

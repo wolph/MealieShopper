@@ -139,18 +139,18 @@ function routerApplyStores(parts) {
 
 function routerApplyOffers(sub, params) {
   const store = params.get("store") || "ah";
+  if (sub === "history") $("#offers-history-search").value = params.get("q") || "";
+  showPanel("offers", routerTab("offers"));
+  routerOpenSubtab(ROUTE_SUBTABS.offers[sub] || "offers-items");
   if (store !== offersState.store && OFFERS_STORES.includes(store)) {
     if (!offersStores().includes(store)) router.pending = window.location.href;
     else offersSwitchStore(store);
   }
   if (sub === "history") {
-    $("#offers-history-search").value = params.get("q") || "";
     const product = params.get("product");
     offerHistory.pinned = Boolean(product);
     if (product) offerHistory.selected = `${offersState.store}:${product}`;
   }
-  showPanel("offers", routerTab("offers"));
-  routerOpenSubtab(ROUTE_SUBTABS.offers[sub] || "offers-items");
 }
 
 function routerApply(href) {
