@@ -729,6 +729,22 @@ class PrefetchTest(FetchCase):
         self.assertEqual(await image_cache.collect_known(now=NOW), 0)
         self.assertEqual(sorted(row["url"].rsplit("/", 1)[1] for row in await rows()), ["bon", "kaas", "melk"])
 
+    async def test_collect_known_checks_the_addresses_off_the_event_loop(self) -> None:
+        """`safe_url` over alle foto's (een paar ms per duizend) loopt in een thread van `compute`, niet op de loop (lage-eindapparaten)."""
+        self.known()
+        loop_thread = threading.get_ident()
+        threads: list[int] = []
+        real = image_cache.safe_url
+
+        def spy(url: Any) -> bool:
+            threads.append(threading.get_ident())
+            return real(url)
+
+        with mock.patch.object(image_cache, "safe_url", spy):
+            self.assertEqual(await image_cache.collect_known(now=NOW), 3)
+        self.assertEqual(len(threads), 3)
+        self.assertNotIn(loop_thread, threads)
+
     async def test_prefetch_fetches_the_newest_first_up_to_the_limit_and_skips_what_waits(self) -> None:
         urls = [f"https://static.ah.nl/dam/product/{n}" for n in range(3)]
         for n, url in enumerate(urls):
