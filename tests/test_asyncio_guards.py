@@ -105,6 +105,9 @@ THREAD_ONLY: frozenset[str] = frozenset(
                 "_schema_copy",
                 "unseal",
                 "_check_staged",
+                "_check_start",
+                "_read_skipped",
+                "_release",
             )
         ),
         "json_pieces.loads",
