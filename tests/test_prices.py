@@ -2439,5 +2439,34 @@ class RegularPointsTest(PricesCase):
         )
 
 
+class NamesOffTheLoopTest(PricesCase):
+    """Lowend: het vouwen van duizenden namen bij het oordeel en bij de ingelezen bestellingen loopt via `compute.run`."""
+
+    def _folded_in(self, call: Any) -> tuple[int, list[int]]:
+        main: int = threading.get_ident()
+        seen: list[int] = []
+        real = prices._fold_name
+
+        def fold(value: Any) -> str:
+            seen.append(threading.get_ident())
+            return real(value)
+
+        with mock.patch.object(prices, "_fold_name", fold):
+            call()
+        return main, seen
+
+    def test_the_verdict_fallback_folds_in_a_thread(self):
+        items: list[dict[str, Any]] = [{"id": "1", "title": "AH Melk", "brand": "AH", "unitSize": "1 l"}]
+        with mock.patch.object(prices, "_line_offers", mock.AsyncMock(return_value={})):
+            main, seen = self._folded_in(lambda: run(prices._verdict_lines("ah", object(), items, ["1"])))
+        assert seen
+        assert main not in seen
+
+    def test_the_names_of_an_imported_order_are_folded_in_a_thread(self):
+        main, seen = self._folded_in(lambda: run(prices.link_names("ah", {"AH Melk"})))
+        assert seen
+        assert main not in seen
+
+
 if __name__ == "__main__":
     unittest.main()

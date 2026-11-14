@@ -364,6 +364,11 @@ def _fill_memos(caches: dict[str, Any]) -> None:
             number += 1
 
 
+def _clear_memos(caches: dict[str, Any]) -> None:
+    for cache in caches.values():
+        cache.cache_clear()
+
+
 @pytest.mark.volume
 async def test_a_full_build_keeps_its_hits_when_the_memos_were_already_full(volume_dir: Path) -> None:
     """Review van taak 9c: in een proces dat dagen draait, zijn de memo's vol met namen van eerder. Dan moet een opbouw nog steeds
@@ -377,8 +382,7 @@ async def test_a_full_build_keeps_its_hits_when_the_memos_were_already_full(volu
         "_stem": line_offers._stem,
         "_size_of": prices._size_of,
     }
-    for name, cache in caches.items():
-        cache.cache_clear()
+    await asyncio.to_thread(_clear_memos, caches)  # leegmaken van volle memo's duurt 16 ms: niet op de loop
     try:  # de volle memo's mogen niet naar de volgende test lekken, ook niet als deze faalt
         # In een thread, zoals de catalogus ze vult: op de event loop hield het vullen hem vijf seconden vast (taak 10).
         await asyncio.to_thread(_fill_memos, caches)
@@ -394,8 +398,7 @@ async def test_a_full_build_keeps_its_hits_when_the_memos_were_already_full(volu
                     assert misses == before[name], (name, cache.cache_info())
                 before[name] = misses
     finally:
-        for cache in caches.values():
-            cache.cache_clear()
+        await asyncio.to_thread(_clear_memos, caches)
 
 
 def test_the_memory_is_plain_dicts_the_collector_skips() -> None:

@@ -760,6 +760,23 @@ def _guessed_row(
     }
 
 
+def _merge_details(found: dict[str, dict[str, Any]], row_sets: list[list[Any]], linked_products: list[_Linked]) -> None:
+    """Vult `found` (van `_product_details`) per veld met de eerste waarde uit de rijen, bron na bron, en als laatste met wat de
+    bonkoppeling weet. Loopt over de rijen van alle bestellingen: buiten de event loop."""
+    fields = (("title", "title"), ("brand", "brand"), ("unitSize", "unit_size"), ("image", "image"))
+    for rows in row_sets:
+        for row in rows:
+            details = found[str(row["product_id"])]
+            for key, column in fields:
+                if not details.get(key) and row[column]:
+                    details[key] = row[column]
+    for linked in linked_products:
+        details = found.get(linked.product_id)
+        for key, value in (("title", linked.title), ("brand", linked.brand), ("unitSize", linked.unit_size)) if details is not None else ():
+            if not details.get(key) and value:
+                details[key] = value
+
+
 async def _product_details(conn: aiosqlite.Connection, store: str, ids: list[str]) -> dict[str, dict[str, Any]]:
     """Wat de app van deze producten weet: `title`, `brand`, `unitSize` en `image`, per veld de nieuwste waarde uit je bestellingen,
     dan de bewaarde prijzen, dan de aanbiedingen. Zonder foto van de winkel de nieuwste bewaarde afbeelding (`product_images`)."""
@@ -772,22 +789,23 @@ async def _product_details(conn: aiosqlite.Connection, store: str, ids: list[str
         ("SELECT product_id, title, brand, unit_size, image, day FROM price_observations WHERE store = ?", (store,)),
         ("SELECT product_id, title, brand, unit_size, image, last_seen AS day FROM offer_history WHERE store = ?", (store,)),
     ]
-    fields = (("title", "title"), ("brand", "brand"), ("unitSize", "unit_size"), ("image", "image"))
-    for sql, args in sources:
-        for row in await conn.execute_fetchall(f"SELECT * FROM ({sql}) WHERE product_id IN ({_in(ids)}) ORDER BY day DESC", (*args, *ids)):
-            details = found[str(row["product_id"])]
-            for key, column in fields:
-                if not details.get(key) and row[column]:
-                    details[key] = row[column]
-    for linked in (await _receipt_products(conn)).values() if store == "ah" else ():  # als laatste: wat de bonkoppeling weet
-        details = found.get(linked.product_id)
-        for key, value in (("title", linked.title), ("brand", linked.brand), ("unitSize", linked.unit_size)) if details is not None else ():
-            if not details.get(key) and value:
-                details[key] = value
+    row_sets: list[list[Any]] = [
+        list(await conn.execute_fetchall(f"SELECT * FROM ({sql}) WHERE product_id IN ({_in(ids)}) ORDER BY day DESC", (*args, *ids)))
+        for sql, args in sources
+    ]
+    linked_products: list[_Linked] = list((await _receipt_products(conn)).values()) if store == "ah" else []
+    await compute.run(_merge_details, found, row_sets, linked_products)
     missing = [product_id for product_id, details in found.items() if not details.get("image")]
     for product_id, images in (await _saved_images(conn, store, missing) if missing else {}).items():
         found[product_id]["image"] = images[0]["url"]
     return found
+
+
+def _split_names(names: set[str], mine: Any, shared_all: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Per naam je eigen koppeling (op de gevouwen naam) en daarna het gedeelde bestand (`link_names`). Vouwt elke naam: buiten de loop."""
+    own = {name: link for name in names if (link := mine.get(_fold_name(name)))}
+    shared = {name: shared_all[key] for name in names if name not in own and (key := name_keys.key(name)) in shared_all}
+    return own, shared
 
 
 async def link_names(store: str, names: Iterable[str]) -> dict[str, dict[str, Any]]:
@@ -804,9 +822,8 @@ async def link_names(store: str, names: Iterable[str]) -> dict[str, dict[str, An
         return {}
     async with _connect() as conn:
         mine = await product_links.load(conn, store)
-        own = {name: link for name in names if (link := mine.names.get(_fold_name(name)))}
         shared_all = shared_links.active(store, await shared_links.rejected(conn, store))
-        shared = {name: shared_all[key] for name in names if name not in own and (key := name_keys.key(name)) in shared_all}
+        own, shared = await compute.run(_split_names, names, mine.names, shared_all)
         rows: list[tuple[Any, ...]] = await _name_rows(conn, _name_sources(await _tables(conn), store))
         rest: list[str] = [name for name in names if name not in own and name not in shared]
         matched = {name: link["productId"] for name, link in own.items()}
@@ -2903,13 +2920,9 @@ async def _verdict_facts(store: str, items: list[dict[str, Any]], today: str) ->
     return _VerdictFacts(catalogue, regulars, recent, episodes, points, bought, lines)
 
 
-async def _verdict_lines(store: str, catalogue: _Catalogue | None, items: list[dict[str, Any]], ids: list[str]) -> dict[str, list[dict[str, Any]]]:
-    """De folderacties voor de hele lijn (per stuk) bij de aanbiedingen, leeg zonder catalogus of als ze niet te lezen zijn. Voor
-    een product dat nog niet in de catalogus staat (de aanbieding van deze week is zijn eerste spoor) zoekt de app op de naam van
-    de aanbieding."""
-    if catalogue is None:
-        return {}
-    fallback: dict[str, _Known] = {
+def _fallback_known(items: list[dict[str, Any]]) -> dict[str, _Known]:
+    """Per aanbieding de naam en de maat om de lijn op te zoeken (`_verdict_lines`): vouwen van duizenden namen, dus buiten de loop."""
+    return {
         str(offer.get("id")): _known(
             "",
             (_fold_name(f"{offer.get('title') or ''} {offer.get('brand') or ''}"),),
@@ -2917,6 +2930,15 @@ async def _verdict_lines(store: str, catalogue: _Catalogue | None, items: list[d
         )
         for offer in items
     }
+
+
+async def _verdict_lines(store: str, catalogue: _Catalogue | None, items: list[dict[str, Any]], ids: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """De folderacties voor de hele lijn (per stuk) bij de aanbiedingen, leeg zonder catalogus of als ze niet te lezen zijn. Voor
+    een product dat nog niet in de catalogus staat (de aanbieding van deze week is zijn eerste spoor) zoekt de app op de naam van
+    de aanbieding."""
+    if catalogue is None:
+        return {}
+    fallback: dict[str, _Known] = await compute.run(_fallback_known, items)
     try:
         return await _line_offers(store, catalogue, ids, fallback)
     except Exception:  # noqa: BLE001 - zonder folderacties blijft de rest van het oordeel staan
