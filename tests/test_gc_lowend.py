@@ -13,6 +13,7 @@ import asyncio
 import gc
 import json
 import sqlite3
+import sys
 import threading
 from contextlib import closing
 from pathlib import Path
@@ -21,7 +22,7 @@ from unittest import mock
 
 from test_backup import BackupCase
 
-from mealieshopper import backup
+from mealieshopper import backup, gc_watch
 
 HISTORY_ROWS: int = 3_000  # rijen in offer_history, genoeg om een verschil per rij te zien
 ADDED_LIMIT: int = 500  # wat het lezen en controleren hooguit aan gevolgde objecten overhoudt, los van het aantal rijen
@@ -107,6 +108,26 @@ class RowsTest(BackupCase):
         again: backup.Plan = backup.prepare({"format": backup.FORMAT, "tables": {"offers_meta": [{"store": "x", "synced_at": "y"}] * 2}})
         first, second = again.tables["offers_meta"].names
         self.assertIs(first, second)  # een tuple van kolommen per vorm, niet per rij
+
+
+def test_a_full_collection_says_how_many_objects_it_walked() -> None:
+    # Wat een volle ronde kost, volgt uit het aantal objecten: in de melding van een stilstand is zo te zien of de app groeide.
+    seen: list[gc_watch.Collection] = []
+    watch: gc_watch.GcWatch = gc_watch.GcWatch(keep=0.0, on_collection=seen.append)
+    watch.start()
+    try:
+        gc.collect()
+    finally:
+        watch.stop()
+    full: gc_watch.Collection = [found for found in seen if found.generation == 2][-1]
+    if sys.version_info < (3, 15):  # pragma: no cover - Python geeft het aantal pas vanaf 3.15
+        assert full.candidates == 0
+        return
+    assert full.candidates > 1000
+    assert full.describe().startswith("GC generatie 2 ")
+    assert full.describe().endswith(" ms in MainThread, " + f"{full.candidates:,}".replace(",", ".") + " objecten")
+    assert gc_watch.Collection(2, 0.05, "MainThread", 0, 166_518).describe() == "GC generatie 2 50 ms in MainThread, 166.518 objecten"
+    assert gc_watch.Collection(2, 0.05, "MainThread", 0).describe() == "GC generatie 2 50 ms in MainThread"
 
 
 class ReleaseTest(BackupCase):

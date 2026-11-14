@@ -16,6 +16,9 @@ de bouw klaar is (`compute.py`). Een koude bouw van AH heeft er bij het begin va
 (`tests/test_volume.py` bewaakt dat), en onder dezelfde belasting duurt de langste volle ronde tijdens vijf koude bouwen 29 ms
 (3.12) of 37 ms (3.15). Onder hypercorn, waar twee rekenthreads tegelijk bouwen en het verkeer doorloopt, duurde de langste
 ronde onder dezelfde belasting 53 ms (3.12) of 59 ms (3.15).
+Het terugzetten van een back-up startte 24 tot 26 volle rondes per keer (3.15, 2026-11-14), omdat de GC elke rij van het bestand
+volgde. Sinds `backup.Rows` geen een. Wat een volle ronde kost, volgt uit het aantal objecten dat hij langsloopt: Python 3.15 geeft
+dat aan de callback (`candidates`), en `describe` noemt het.
 Bevriezen (`gc.freeze`) is geprobeerd en weer weggehaald: een verbinding die bij het bevriezen open stond, bleef na het sluiten
 voor altijd bewaard.
 
@@ -40,15 +43,20 @@ KEPT: int = 100
 
 @dataclass(frozen=True)
 class Collection:
-    """Een ronde van de GC: de generatie, hoe lang hij duurde, de thread en hoeveel objecten hij opruimde."""
+    """Een ronde van de GC: de generatie, hoe lang hij duurde, de thread, hoeveel objecten hij opruimde en (vanaf 3.15) langs
+    hoeveel objecten hij liep (`candidates`, 0 als Python het niet zegt)."""
 
     generation: int
     seconds: float
     thread: str
     collected: int
+    candidates: int = 0
 
     def describe(self) -> str:
-        return f"GC generatie {self.generation} {round(self.seconds * 1000)} ms in {self.thread}"
+        line: str = f"GC generatie {self.generation} {round(self.seconds * 1000)} ms in {self.thread}"
+        if self.candidates:  # wat een volle ronde kost, volgt uit dit aantal: zo is te zien of de app of de tests groeiden
+            line += ", " + f"{self.candidates:,}".replace(",", ".") + " objecten"
+        return line
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -103,6 +111,7 @@ class GcWatch:
             seconds,
             threading.current_thread().name,
             int(info.get("collected", 0)),
+            int(info.get("candidates", 0)),
         )
         self.recent.append(found)
         if self._on_collection is not None:
