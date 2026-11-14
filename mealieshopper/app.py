@@ -37,6 +37,7 @@ from . import (
     crisp_orders,
     deals,
     factory_reset,
+    gc_watch,
     hellofresh,
     http_client,
     image_cache,
@@ -235,6 +236,10 @@ def create_app() -> Quart:
                 app.logger.info("Pauze van de afbeeldingencache opgeheven voor %s", host)
         except (sqlite3.Error, OSError):
             app.logger.warning("Kon de pauze van de afbeeldingencache niet opheffen", exc_info=True)
+        if gc_watch.freeze_wanted():
+            # Na het opstartwerk en voor de achtergrondtaken en de eerste aanvraag: zie gc_watch.py. Een volle ronde loopt hierna
+            # alleen langs wat sindsdien bij kwam. De `collect` vooraf houdt de loop een keer kort vast, voordat er iets te doen is.
+            app.logger.info("GC: %d objecten van de start bevroren", gc_watch.freeze_after_start())
         # De dagelijkse aanbiedingen-run hoort niet in de tests: die maken de app vaak aan.
         if not environ.get("MEALIESHOPPER_TESTING"):
             offers_schedule.start()

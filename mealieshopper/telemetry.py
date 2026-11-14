@@ -347,9 +347,9 @@ class Telemetry:
         logger.warning("Een ronde van de garbage collector hield de GIL vast: %s", collection.describe())
 
     def gc_counts(self) -> dict[str, Any]:
-        """Voor `snapshot`: de lange rondes, en hoeveel objecten bevroren zijn. De app bevriest niets (gc_watch.py), dus `frozen`
-        blijft wat Python zelf bij het starten meegeeft: 375 bij 3.12 (ook een kale `python -I -S`), 0 bij 3.15. Stijgt het, dan
-        riep een bibliotheek `gc.freeze()` aan en volgt de GC die objecten niet meer.
+        """Voor `snapshot`: de lange rondes, en hoeveel objecten bevroren zijn. De app bevriest een keer na de start
+        (`gc_watch.freeze_after_start`, `MEALIESHOPPER_GC_FREEZE`), dus `frozen` is wat er toen leefde, zo'n 127.000. Stijgt het
+        daarna, dan riep een bibliotheek `gc.freeze()` aan en volgt de GC die objecten niet meer.
 
         `counters` zijn de tellers van `gc.get_count()`, geen aantallen objecten: voor generatie 0 de objecten erbij sinds de
         laatste ronde, voor 1 en 2 het aantal rondes van de generatie eronder. `gc.get_freeze_count()` loopt de bevroren lijst af

@@ -19,8 +19,15 @@ ronde onder dezelfde belasting 53 ms (3.12) of 59 ms (3.15).
 Het terugzetten van een back-up startte 24 tot 26 volle rondes per keer (3.15, 2026-11-14), omdat de GC elke rij van het bestand
 volgde. Sinds `backup.Rows` geen een. Wat een volle ronde kost, volgt uit het aantal objecten dat hij langsloopt: Python 3.15 geeft
 dat aan de callback (`candidates`), en `describe` noemt het.
-Bevriezen (`gc.freeze`) is geprobeerd en weer weggehaald: een verbinding die bij het bevriezen open stond, bleef na het sluiten
-voor altijd bewaard.
+Het grootste deel van wat een volle ronde langsloopt, is van de start: 110.000 objecten na de imports (functies en dicts van
+Quart, werkzeug, cryptography, httpx en de app zelf), 127.000 als de app draait. Die blijven het hele proces bestaan, dus de app
+zet ze een keer na de start in de vaste generatie (`freeze_after_start`, voor de eerste aanvraag). Daarna loopt een volle ronde
+alleen langs wat sindsdien bij kwam: in de nachtelijke ronde 9 tot 17 ms in plaats van 33 tot 55 ms (3.15, 2026-11-14), op
+een apparaat dat vijf tot acht keer trager is het verschil tussen ongeveer 100 en 300 tot 450 ms stilstand.
+Bevriezen tijdens een bouw (taak 9b) is weer weggehaald: een verbinding die op dat moment net gesloten was, zat nog in een dode
+kring en bleef voor altijd bewaard. `freeze_after_start` ruimt daarom eerst alles op (`gc.collect()`) en bevriest voordat de
+server een verbinding aanneemt. Wat bij de start leeft en later in een kring vrijkomt, ruimt de GC niet meer op: dat is
+eenmalig en begrensd. Wat na de start ontstaat, ruimt hij gewoon op (`tests/test_gc_watch.py`).
 
 `GcWatch.start()` hangt de meting aan, `stop()` haalt hem weg. Rondes van `keep` seconden of langer worden bewaard en aan
 `on_collection` gegeven (in de thread van de GC, dus kort houden). De telemetrie gebruikt dit als `MEALIESHOPPER_TELEMETRY_GC`
@@ -30,15 +37,36 @@ aan staat, de volumetests altijd.
 from __future__ import annotations
 
 import gc
+import os
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 GC_SECONDS: float = 0.02  # een ronde van zo lang of langer wordt bewaard
 KEPT: int = 100
+FREEZE_ENV: str = "MEALIESHOPPER_GC_FREEZE"
+OFF: frozenset[str] = frozenset({"0", "false", "no", "off"})
+
+
+def freeze_wanted(environ: Mapping[str, str] = os.environ) -> bool:
+    """Of de app na de start bevriest (`MEALIESHOPPER_GC_FREEZE`, standaard aan). In de tests standaard uit
+    (`MEALIESHOPPER_TESTING`): die maken veel apps in een proces, en een test die het nodig heeft, zet het zelf aan."""
+    value: str | None = environ.get(FREEZE_ENV)
+    if value is None:
+        return not environ.get("MEALIESHOPPER_TESTING")
+    return value.strip().lower() not in OFF
+
+
+def freeze_after_start() -> int:
+    """Ruimt eerst alles op wat al dood is en zet dan wat leeft in de vaste generatie (`gc.freeze`), zodat een volle ronde daarna
+    alleen langs nieuwe objecten loopt. Een keer, na de start en voor de eerste aanvraag: er is dan nog geen verbinding van de
+    server. Geeft het aantal bevroren objecten."""
+    gc.collect()
+    gc.freeze()
+    return gc.get_freeze_count()
 
 
 @dataclass(frozen=True)

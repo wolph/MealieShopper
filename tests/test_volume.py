@@ -24,7 +24,7 @@ import sqlite3
 import threading
 import time
 import zlib
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 from unittest import mock
@@ -497,17 +497,29 @@ async def test_price_history_does_not_stall(volume_client: TestClientProtocol, v
     assert answer["products"]
 
 
+@contextlib.contextmanager
+def frozen_like_production(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """De app bevriest na haar start wat er dan leeft (`gc_watch.freeze_after_start`), zoals buiten de tests. Hier zit de rest van
+    de suite daar ook in, zoals in productie alles van de start. Na de test gaat het weer los (`gc.unfreeze`)."""
+    monkeypatch.setenv(gc_watch.FREEZE_ENV, "true")
+    try:
+        yield
+    finally:
+        gc.unfreeze()
+
+
 @pytest.mark.volume
-async def test_startup_warming_does_not_stall(volume_dir: Path) -> None:
+async def test_startup_warming_does_not_stall(volume_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app: Quart = create_app()
-    async with app.test_app():
+    with frozen_like_production(monkeypatch):
+        async with app.test_app():
 
-        async def warm_at_start() -> None:
-            """Wat `before_serving` buiten de tests start (`warm_at_start` in app.py)."""
-            await prices.warm_catalogues()
-            await app.extensions["mealieshopper_warm_offers"]()
+            async def warm_at_start() -> None:
+                """Wat `before_serving` buiten de tests start (`warm_at_start` in app.py)."""
+                await prices.warm_catalogues()
+                await app.extensions["mealieshopper_warm_offers"]()
 
-        await quiet(warm_at_start, prepare=cold(volume_dir))
+            await quiet(warm_at_start, prepare=cold(volume_dir))
 
 
 @pytest.mark.volume
@@ -1259,8 +1271,9 @@ async def test_the_nightly_tasks_do_not_stall(volume_dir: Path, fake_stores: Non
     # De ronde langs de prijsindex staat in de tests uit (conftest.py): die heeft haar eigen test hierboven.
     nightly: Callable[[], Awaitable[Any]] = _nightly(volume_dir, monkeypatch)
     app: Quart = create_app()  # met de opwarmer van /api/offers, die de run als laatste aanroept
-    async with app.test_app():
-        await quiet(nightly, prepare=restored(volume_dir / volume.DB_NAME, NIGHTLY_TABLES))
+    with frozen_like_production(monkeypatch):
+        async with app.test_app():
+            await quiet(nightly, prepare=restored(volume_dir / volume.DB_NAME, NIGHTLY_TABLES))
 
 
 # Hoeveel gevolgde objecten een nachtelijke run er hooguit bij heeft op het moment dat een volle ronde van de GC begint, in welke
