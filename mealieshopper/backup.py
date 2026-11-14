@@ -676,11 +676,11 @@ def read_file(path: Path) -> dict[str, Any]:
     een gewoon JSON-bestand (een back-up van eerder, of met de hand uitgepakt) wordt gelezen zoals het is. Wat uit een
     gzip-bestand komt, gaat door dezelfde controles als een gewoon bestand.
     """
-    return _read_file(path, None)
+    return _read_file(path, list)
 
 
-def _read_file(path: Path, each: Callable[[Any], Any] | None) -> dict[str, Any]:
-    """`read_file`, met `each` op elke rij van `tables` zodra die gelezen is (json_pieces.py)."""
+def _read_file(path: Path, rows: Callable[[], Any]) -> dict[str, Any]:
+    """`read_file`, met de rijen van elke tabel in `tables` in een `rows()` (json_pieces.py): een lijst, of `Rows`."""
     try:
         size = path.stat().st_size
         with path.open("rb") as handle:
@@ -698,7 +698,7 @@ def _read_file(path: Path, each: Callable[[Any], Any] | None) -> dict[str, Any]:
                 handle.seek(0)
                 content = handle.read()
             # In stukken (json_pieces.py): json.loads van een back-up van 150 MB hield de GIL bijna 400 ms in een keer vast.
-            data = json_pieces.loads(content.decode("utf-8-sig"), "tables", parse_constant=_reject_constant, each=each)
+            data = json_pieces.loads(content.decode("utf-8-sig"), "tables", parse_constant=_reject_constant, rows=rows)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise BackupError("not_a_backup") from None
     if not isinstance(data, dict) or data.get("format") != FORMAT:
@@ -712,33 +712,68 @@ def _read_file(path: Path, each: Callable[[Any], Any] | None) -> dict[str, Any]:
 
 
 def read_plan(path: Path) -> Plan:
-    """`read_file` en `prepare` in een keer: de fase die het bestand leest, als geheel voor `asyncio.to_thread`. Elke rij wordt
-    meteen een `Row` (`_compact`), zodat de dicts van het bestand er nooit allemaal tegelijk zijn."""
-    return prepare(_read_file(path, _compact({})))
+    """`read_file` en `prepare` in een keer: de fase die het bestand leest, als geheel voor `asyncio.to_thread`. Elke rij gaat
+    meteen in `Rows`, zodat de dicts van het bestand er nooit allemaal tegelijk zijn."""
+    shapes: dict[tuple[str, ...], tuple[str, ...]] = {}
+    return prepare(_read_file(path, lambda: Rows(shapes)))
 
 
-# Een rij als (kolommen, waarden): twee gewone tuples, en de kolommen een keer per tabel en vorm (`_compact`). Een dict per rij
-# volgt de GC sinds Python 3.14 altijd (ook met alleen tekst en getallen erin), en een volle ronde loopt langs elk gevolgd object
-# met de GIL vast: met de 450.000 rijen van een back-up op de schaal van productie 120 ms per ronde (3.15), terwijl de event loop
-# wacht. Een tuple met alleen tekst, getallen, bytes en None volgt de GC na de eerste ronde niet meer.
-Row = tuple[tuple[str, ...], tuple[Any, ...]]
+RELEASE_PIECE: int = 10_000  # zoveel rijen geeft `Rows.release` per keer vrij
 
 
-def _compact(shapes: dict[tuple[str, ...], tuple[str, ...]]) -> Callable[[Any], Any]:
-    """Maakt van een rij (een dict) een `Row`, met de kolommen uit `shapes`. Iets anders dan een dict blijft wat het is: dat
-    weigert `prepare`."""
+class Rows:
+    """De rijen van een tabel: per rij de kolommen (een tuple per vorm, gedeeld) en de waarden (een tuple per rij), in twee lijsten.
 
-    def compact(row: Any) -> Any:
+    Een volle ronde van de GC loopt met de GIL vast langs elk object dat de GC volgt, en een back-up op de schaal van productie heeft
+    450.000 rijen. Een dict per rij volgt de GC altijd. Een tuple met alleen tekst, getallen, bytes en None volgt de GC op 3.15
+    niet, als hij uit een uitgepakte reeks komt (`(*rij.values(),)`, niet `tuple(rij.values())`), maar een tuple met een andere
+    tuple erin wel, tot een ronde hem loslaat. Een rij als `(kolommen, waarden)` en een paar `(nummer, rij)` volgde de GC dus
+    toch, en wat de jonge rondes niet loslieten, telde mee voor de volgende volle ronde: zo startte een keer terugzetten 24 tot 26
+    volle rondes van 30 tot 56 ms (`tests/test_gc_lowend.py`). Hier volgt de GC alleen de twee lijsten.
+    """
+
+    __slots__ = ("names", "refused", "shapes", "values")
+
+    def __init__(self, shapes: dict[tuple[str, ...], tuple[str, ...]] | None = None) -> None:
+        self.shapes: dict[tuple[str, ...], tuple[str, ...]] = {} if shapes is None else shapes
+        self.names: list[tuple[str, ...]] = []
+        self.values: list[tuple[Any, ...]] = []
+        self.refused: bool = False  # er kwam iets anders dan een object: dat weigert `prepare`
+
+    def append(self, row: Any) -> None:
+        """Een rij als dict, zoals in het bestand. Iets anders telt niet en zet `refused`."""
         if not isinstance(row, dict):
-            return row
-        names: tuple[str, ...] = tuple(row)
-        return (shapes.setdefault(names, names), tuple(row.values()))
+            self.refused = True
+            return
+        names: tuple[str, ...] = (*row,)
+        self.names.append(self.shapes.setdefault(names, names))
+        self.values.append((*row.values(),))
 
-    return compact
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def numbered(self) -> Iterator[tuple[int, tuple[str, ...], tuple[Any, ...]]]:
+        """(regelnummer, kolommen, waarden) per rij, vanaf 1, de regel in het bestand."""
+        for number, (names, values) in enumerate(zip(self.names, self.values, strict=True), 1):
+            yield number, names, values
+
+    def release(self) -> None:
+        """Maakt de lijsten leeg in stukken van `RELEASE_PIECE`, in de thread die het vraagt.
+
+        Een lijst van 450.000 tuples in een keer loslaten is een aanroep in C (`list_dealloc`) die de GIL 45 ms vasthoudt, ook in
+        een thread. Liet de loop de laatste verwijzing los (het Plan van `start_job` aan het eind van de coroutine), dan deed de
+        loop dat zelf. Tussen twee stukken draait Python, en daar kan de loop de GIL krijgen."""
+        for found in (self.values, self.names):
+            while found:
+                del found[-RELEASE_PIECE:]
 
 
-def _row_dict(row: Row) -> dict[str, Any]:
-    return dict(zip(*row, strict=True))
+def _release(*held: Plan | dict[str, Rows] | None) -> None:
+    """Geeft de rijen van een Plan en van `check_rows` vrij in stukken (`Rows.release`), in de thread van de fase."""
+    for found in held:
+        tables: dict[str, Rows] = found.tables if isinstance(found, Plan) else (found or {})
+        for rows in tables.values():
+            rows.release()
 
 
 class Plan:
@@ -751,7 +786,7 @@ class Plan:
         self.sealed: Any = None
         self.plain: dict[str, str] = {}
         self.secrets: dict[str, str] | None = None  # None zolang het wachtwoord niet is gebruikt
-        self.tables: dict[str, list[tuple[int, Row]]] = {}
+        self.tables: dict[str, Rows] = {}
         self.left_out: list[str] = []  # onderdelen die niet in het bestand zitten
         self.skipped: list[str] = []  # onderdelen die de beheerder niet terugzet
 
@@ -772,7 +807,7 @@ class Plan:
             if part not in self.left_out and part not in self.skipped:
                 self.skipped.append(part)
                 for table in PARTS[part]:
-                    self.tables.pop(table, None)
+                    self.tables.pop(table, Rows()).release()
                 if part == SETTINGS_PART:
                     self.plain = {}
         self.skipped.sort()
@@ -830,16 +865,21 @@ def prepare(data: dict[str, Any]) -> Plan:
     tables = data.get("tables", {})
     if not isinstance(tables, dict):
         raise BackupError("bad_structure", detail="tables")
-    compact: Callable[[Any], Any] = _compact({})
+    shapes: dict[tuple[str, ...], tuple[str, ...]] = {}
     for table, rows in tables.items():
         if table not in DATA_TABLES:
             raise BackupError("bad_table", table=str(table)[:60])
         if table in absent:  # het bestand zegt dat dit onderdeel er niet in zit, maar het staat er wel: bewerkt
             raise BackupError("bad_structure", detail="left_out")
-        # Een rij is een object: `read_plan` maakt er al bij het lezen een `Row` van, wie `read_file` zelf leest heeft nog dicts.
-        if not isinstance(rows, list) or not all(isinstance(row, (dict, tuple)) for row in rows):
+        # Een rij is een object: `read_plan` zet ze al bij het lezen in `Rows`, wie `read_file` zelf leest heeft een lijst van dicts.
+        if isinstance(rows, list):
+            found: Rows = Rows(shapes)
+            for row in rows:
+                found.append(row)
+            rows = found
+        if not isinstance(rows, Rows) or rows.refused:
             raise BackupError("bad_structure", detail=str(table))
-        plan.tables[table] = [(number, compact(row)) for number, row in enumerate(rows, 1)]
+        plan.tables[table] = rows
     return plan
 
 
@@ -891,33 +931,37 @@ def _decoded(table: str, number: int, row: dict[str, Any], known: dict[str, bool
     return values
 
 
-def check_rows(plan: Plan, progress: Callable[[int, int], None] | None = None) -> dict[str, list[tuple[int, Row]]]:
+def check_rows(plan: Plan, progress: Callable[[int, int], None] | None = None) -> dict[str, Rows]:
     """Legt elke rij tegen een lege kopie van het schema (types, verplichte kolommen, dubbele sleutels).
 
-    Geeft de rijen terug zoals ze ingevoegd gaan worden (waarden ontcijferd), als `Row`. Niets in de echte database verandert.
+    Geeft de rijen terug zoals ze ingevoegd gaan worden (waarden ontcijferd), in `Rows`. Niets in de echte database verandert.
     Eerst `ensure_schemas`.
     """
     with closing(thread_db.connect()) as real, closing(_schema_copy(real)) as scratch:
         known = {table: _column_rules(real, table) for table in DATA_TABLES}
-        prepared: dict[str, list[tuple[int, Row]]] = {}
-        compact: Callable[[Any], Any] = _compact({})
-        for step, table in enumerate(DATA_TABLES, 1):
-            rows = []
-            for number, row in plan.tables.get(table, []):
-                values = _decoded(table, number, _row_dict(row), known[table])
-                names = list(values)
-                if names:
-                    sql = f"INSERT INTO {_quote(table)} ({', '.join(_quote(n) for n in names)}) VALUES ({', '.join('?' for _ in names)})"
-                else:
-                    sql = f"INSERT INTO {_quote(table)} DEFAULT VALUES"
-                try:
-                    scratch.execute(sql, [values[n] for n in names])
-                except (sqlite3.Error, OverflowError) as exc:
-                    raise BackupError("bad_row", table=table, line=number, error=str(exc)[:200]) from exc
-                rows.append((number, compact(values)))
-            prepared[table] = rows
-            if progress:
-                progress(step, len(DATA_TABLES))
+        prepared: dict[str, Rows] = {}
+        shapes: dict[tuple[str, ...], tuple[str, ...]] = {}
+        try:
+            for step, table in enumerate(DATA_TABLES, 1):
+                rows: Rows = Rows(shapes)
+                prepared[table] = rows
+                for number, columns, cells in plan.tables.get(table, Rows()).numbered():
+                    values = _decoded(table, number, dict(zip(columns, cells, strict=True)), known[table])
+                    names = list(values)
+                    if names:
+                        sql = f"INSERT INTO {_quote(table)} ({', '.join(_quote(n) for n in names)}) VALUES ({', '.join('?' for _ in names)})"
+                    else:
+                        sql = f"INSERT INTO {_quote(table)} DEFAULT VALUES"
+                    try:
+                        scratch.execute(sql, [values[n] for n in names])
+                    except (sqlite3.Error, OverflowError) as exc:
+                        raise BackupError("bad_row", table=table, line=number, error=str(exc)[:200]) from exc
+                    rows.append(values)
+                if progress:
+                    progress(step, len(DATA_TABLES))
+        except BaseException:
+            _release(prepared)  # een geweigerde rij: wat al klaarstond gaat hier weg, niet later op de loop met de fout
+            raise
     return prepared
 
 
@@ -937,7 +981,7 @@ def summarize(plan: Plan) -> dict[str, Any]:
 
 def replace_everything(
     plan: Plan,
-    prepared: dict[str, list[tuple[int, Row]]],
+    prepared: dict[str, Rows],
     on_commit: Callable[[sqlite3.Connection, dict[str, Any]], None],
     box: Fernet | None,
 ) -> dict[str, Any]:
@@ -964,8 +1008,9 @@ def replace_everything(
             if table in kept:
                 continue
             groups: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
-            for _, (names, values) in prepared.get(table, []):
-                if table in USER_TABLES and _row_dict((names, values)).get("user_id") not in users:
+            rows: Rows = prepared.get(table, Rows())
+            for names, values in zip(rows.names, rows.values, strict=True):
+                if table in USER_TABLES and dict(zip(names, values, strict=True)).get("user_id") not in users:
                     # Een profiel (of wat het weekmenu onthoudt) van iemand die op deze installatie niet bestaat.
                     skipped_profiles += table == "user_profiles"
                     continue
@@ -1097,8 +1142,37 @@ async def stage_upload(token: str, size: Any) -> dict[str, Any]:
 def _check_staged(path: Path) -> dict[str, Any]:
     """Lezen en controleren van een klaargezet bestand, als geheel voor `asyncio.to_thread`."""
     plan: Plan = read_plan(path)
-    check_rows(plan)
-    return summarize(plan)
+    prepared: dict[str, Rows] | None = None
+    try:
+        prepared = check_rows(plan)
+        return summarize(plan)
+    finally:
+        _release(plan, prepared)
+
+
+def _check_start(path: Path, passphrase: str, skip_links: bool, skip_parts: tuple[Any, ...]) -> None:
+    """Wat `start_job` van het bestand wil weten, als geheel voor `asyncio.to_thread`: of er na het overslaan iets overblijft
+    en of het wachtwoord klopt. Het Plan blijft in de thread en gaat daar in stukken weg (`_release`)."""
+    plan: Plan = read_plan(path)  # het bestand dat nu staat, niet wat een uur geleden is gecontroleerd
+    try:
+        plan.skip(links=skip_links, parts=skip_parts)
+        if not plan.restores_anything():
+            raise BackupError("nothing_to_restore")
+        if plan.needs_passphrase:
+            unseal(plan.sealed, passphrase)  # een verkeerd wachtwoord laat het bestand en het token staan
+    finally:
+        _release(plan)
+
+
+def _read_skipped(path: Path, skip_links: bool, skip_parts: Any) -> Plan:
+    """`read_plan` en `Plan.skip` in een keer, voor `asyncio.to_thread`: wat `skip` weglaat, gaat in de thread weg."""
+    plan: Plan = read_plan(path)
+    try:
+        plan.skip(links=skip_links, parts=skip_parts)
+    except BaseException:
+        _release(plan)
+        raise
+    return plan
 
 
 async def discard(token: str) -> None:
@@ -1197,12 +1271,7 @@ async def start_job(token: str, passphrase: str, *, skip_links: bool = False, sk
     if not path.is_file():
         raise BackupError("stage_missing", 404)
     skip_parts = tuple(skip_parts)
-    plan: Plan = await asyncio.to_thread(read_plan, path)  # het bestand dat nu staat, niet wat een uur geleden is gecontroleerd
-    plan.skip(links=skip_links, parts=skip_parts)
-    if not plan.restores_anything():
-        raise BackupError("nothing_to_restore")
-    if plan.needs_passphrase:
-        await asyncio.to_thread(unseal, plan.sealed, passphrase)  # een verkeerd wachtwoord laat het bestand en het token staan
+    await asyncio.to_thread(_check_start, path, passphrase, skip_links, skip_parts)
     running: Path = path.with_name(path.name + ".job")
     job_id: str = secrets.token_hex(8)
     async with _ajobs_connect() as conn:
@@ -1263,26 +1332,32 @@ async def run_job(job_id: str, staged: Path, passphrase: str, *, skip_links: boo
 async def _run_phases(job_id: str, staged: Path, passphrase: str, *, skip_links: bool = False, skip_parts: Any = ()) -> None:
     """Elke fase loopt als geheel in een thread, de stand van de klus wordt ertussen bijgewerkt."""
     started: float = time.monotonic()
-    plan: Plan = await asyncio.to_thread(read_plan, staged)
-    plan.skip(links=skip_links, parts=skip_parts)
-    if plan.needs_passphrase:
-        plan.secrets = await asyncio.to_thread(unseal, plan.sealed, passphrase)
-    await ensure_schemas()
-    prepared: dict[str, list[tuple[int, Row]]] = await asyncio.to_thread(
-        check_rows, plan, lambda step, steps: _job_update(job_id, step=step, steps=steps)
-    )
-    checking: float = time.monotonic() - started
-    # Het terugzetten zelf is één transactie en dus niet te tellen: de voortgang blijft "bezig" zonder getal.
-    await _ajob_update(job_id, phase="replacing", step=0, steps=0, checking_seconds=round(checking, 2))
-    replacing_started: float = time.monotonic()
+    plan: Plan = await asyncio.to_thread(_read_skipped, staged, skip_links, skip_parts)
+    prepared: dict[str, Rows] | None = None
+    cancelled: bool = False
+    try:
+        if plan.needs_passphrase:
+            plan.secrets = await asyncio.to_thread(unseal, plan.sealed, passphrase)
+        await ensure_schemas()
+        prepared = await asyncio.to_thread(check_rows, plan, lambda step, steps: _job_update(job_id, step=step, steps=steps))
+        checking: float = time.monotonic() - started
+        # Het terugzetten zelf is één transactie en dus niet te tellen: de voortgang blijft "bezig" zonder getal.
+        await _ajob_update(job_id, phase="replacing", step=0, steps=0, checking_seconds=round(checking, 2))
+        replacing_started: float = time.monotonic()
 
-    def done(conn: sqlite3.Connection, summary: dict[str, Any]) -> None:
-        now: str = _now()
-        conn.execute(JOB_DONE_SQL, (json.dumps(summary), round(time.monotonic() - replacing_started, 2), now, now, job_id))
+        def done(conn: sqlite3.Connection, summary: dict[str, Any]) -> None:
+            now: str = _now()
+            conn.execute(JOB_DONE_SQL, (json.dumps(summary), round(time.monotonic() - replacing_started, 2), now, now, job_id))
 
-    box: Fernet | None = await auth.secret_box() if plan.secrets is not None else None  # alleen voor de koppelingen
-    await ensure_schemas()
-    await asyncio.to_thread(replace_everything, plan, prepared, done, box)
+        box: Fernet | None = await auth.secret_box() if plan.secrets is not None else None  # alleen voor de koppelingen
+        await ensure_schemas()
+        await asyncio.to_thread(replace_everything, plan, prepared, done, box)
+    except asyncio.CancelledError:
+        cancelled = True  # een fase kan nog in haar thread lopen en de rijen lezen: dan laten we ze staan
+        raise
+    finally:
+        if not cancelled:  # niet op de loop loslaten: dat is een lange aanroep in C (`_release`)
+            await asyncio.to_thread(_release, plan, prepared)
     auth.forget_cached_data()  # geen catalogus en geen lijst aanbiedingen van de oude gegevens meer in het geheugen
     log.info("Back-up teruggezet in %.1f s", time.monotonic() - started)
 

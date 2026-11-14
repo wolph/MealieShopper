@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
 _SPACE: re.Pattern[str] = re.compile(r"[ \t\n\r]*")  # de witruimte van JSON (RFC 8259), dezelfde als in `json.decoder`
 
@@ -56,24 +56,30 @@ def _object(text: str, position: int, decoder: json.JSONDecoder, value: Value) -
         position = _skip(text, _expect(text, position, ","))
 
 
-def _shared(keys: dict[str, str], each: Callable[[Any], Any] | None) -> Callable[[Any], Any]:
+class Rows(Protocol):
+    """Waar de rijen van een lijst in komen: een `list`, of iets anders met `append` (`backup.Rows`)."""
+
+    def append(self, row: Any, /) -> None: ...
+
+
+def _shared(keys: dict[str, str]) -> Callable[[Any], Any]:
     """Wat er met elke rij gebeurt: een dict krijgt de sleutels uit `keys`, een keer per tekst (zo deelt een tabel van
-    honderdduizenden rijen zijn kolomnamen, zoals in een enkele aanroep van `json.loads`), en daarna `each`."""
+    honderdduizenden rijen zijn kolomnamen, zoals in een enkele aanroep van `json.loads`)."""
 
     def finish(row: Any) -> Any:
         if isinstance(row, dict):
             row = {keys.setdefault(key, key): cell for key, cell in row.items()}
-        return row if each is None else each(row)
+        return row
 
     return finish
 
 
-def _rows(text: str, position: int, decoder: json.JSONDecoder, finish: Callable[[Any], Any]) -> tuple[Any, int]:
-    """Een lijst van rijen, een rij per aanroep van `raw_decode`, elke rij door `finish`. Iets anders dan een lijst gaat in een
-    keer."""
+def _rows(text: str, position: int, decoder: json.JSONDecoder, finish: Callable[[Any], Any], rows: Callable[[], Rows]) -> tuple[Any, int]:
+    """Een lijst van rijen, een rij per aanroep van `raw_decode`, elke rij door `finish` in een nieuwe `rows()`. Iets anders dan
+    een lijst gaat in een keer."""
     if not text.startswith("[", position):
         return decoder.raw_decode(text, position)
-    found: list[Any] = []
+    found: Rows = rows()
     position = _skip(text, position + 1)
     if text.startswith("]", position):
         return found, position + 1
@@ -87,25 +93,26 @@ def _rows(text: str, position: int, decoder: json.JSONDecoder, finish: Callable[
         position = _skip(text, _expect(text, position, ","))
 
 
-def _tables(text: str, position: int, decoder: json.JSONDecoder, finish: Callable[[Any], Any]) -> tuple[Any, int]:
+def _tables(text: str, position: int, decoder: json.JSONDecoder, finish: Callable[[Any], Any], rows: Callable[[], Rows]) -> tuple[Any, int]:
     """Het object van tabelnaam naar rijen. Iets anders dan een object gaat in een keer."""
     if not text.startswith("{", position):
         return decoder.raw_decode(text, position)
-    return _object(text, position, decoder, lambda key, at: _rows(text, at, decoder, finish))
+    return _object(text, position, decoder, lambda key, at: _rows(text, at, decoder, finish, rows))
 
 
-def loads(text: str, split: str, parse_constant: Callable[[str], Any] | None = None, each: Callable[[Any], Any] | None = None) -> Any:
+def loads(text: str, split: str, parse_constant: Callable[[str], Any] | None = None, rows: Callable[[], Rows] = list) -> Any:
     """`json.loads(text, parse_constant=parse_constant)`, met de waarde van de sleutel `split` van het object bovenaan (een object
-    van lijsten) een element per aanroep. `each` krijgt elk element zodra het gelezen is en geeft terug wat er in de lijst komt:
-    zo hoeft de aanroeper de rijen niet allemaal tegelijk als dict te hebben. Zonder `each` is het resultaat dat van `json.loads`."""
+    van lijsten) een element per aanroep. Elke lijst daarin wordt een `rows()`, met elk element erin zodra het gelezen is: zo
+    hoeft de aanroeper de rijen niet allemaal tegelijk als dict te hebben (`backup.Rows`). Met een `list` (standaard) is het
+    resultaat dat van `json.loads`."""
     decoder: json.JSONDecoder = json.JSONDecoder(parse_constant=parse_constant)
     position: int = _skip(text, 0)
     if not text.startswith("{", position):
         return decoder.decode(text)
-    finish: Callable[[Any], Any] = _shared({}, each)
+    finish: Callable[[Any], Any] = _shared({})
 
     def value(key: str, at: int) -> tuple[Any, int]:
-        return _tables(text, at, decoder, finish) if key == split else decoder.raw_decode(text, at)
+        return _tables(text, at, decoder, finish, rows) if key == split else decoder.raw_decode(text, at)
 
     found: dict[str, Any]
     found, position = _object(text, position, decoder, value)

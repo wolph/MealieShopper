@@ -84,7 +84,16 @@ def test_each_row_is_its_own_call(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(calls) == 3 + 1 + len(rows)
 
 
-def test_each_gets_every_row_as_it_is_read() -> None:
-    text: str = '{"tables":{"a":[{"id":1},{"id":2}],"b":[3]},"rest":[{"id":4}]}'
-    found: Any = json_pieces.loads(text, "tables", each=lambda row: ("rij", row))
-    assert found == {"tables": {"a": [("rij", {"id": 1}), ("rij", {"id": 2})], "b": [("rij", 3)]}, "rest": [{"id": 4}]}
+class _Collected(list[Any]):
+    """Een lijst die laat zien dat `rows` hem maakte, en elke rij als ("rij", rij) bewaart."""
+
+    def append(self, row: Any, /) -> None:
+        super().append(("rij", row))
+
+
+def test_rows_gets_every_row_as_it_is_read() -> None:
+    text: str = '{"tables":{"a":[{"id":1},{"id":2}],"b":[3],"c":[]},"rest":[{"id":4}]}'
+    found: Any = json_pieces.loads(text, "tables", rows=_Collected)
+    assert found == {"tables": {"a": [("rij", {"id": 1}), ("rij", {"id": 2})], "b": [("rij", 3)], "c": []}, "rest": [{"id": 4}]}
+    assert all(type(rows) is _Collected for rows in found["tables"].values())
+    assert type(found["rest"]) is list  # alleen de lijsten onder `tables`
